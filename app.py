@@ -25,7 +25,6 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageOps
-from scipy.spatial import cKDTree
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EMOJI_DIR = os.path.join(BASE_DIR, "assets", "emoji")
@@ -296,9 +295,9 @@ def build_mosaic(img, stems, mean_lab, hists, grid_w, tile_px,
         e2 = (pool ** 2).sum(axis=1)
         tile_vec = thumb * thumb * 3
         # Process the resized image in bands of tile rows so the float32 Lab
-        # working set stays bounded (~24MB per band; band + its Lab conversion
+        # working set stays bounded (~12MB per band; band + its Lab conversion
         # + the tile-vector copy coexist transiently) on small hosts.
-        band_rows = max(1, int(24e6 / (grid_w * tile_vec * 4)))
+        band_rows = max(1, int(12e6 / (grid_w * tile_vec * 4)))
         pick = np.empty(n_tiles, dtype=np.int64)
         top_idx_all, top_dist_all = [], []
         for r0 in range(0, grid_h, band_rows):
@@ -341,7 +340,7 @@ def build_mosaic(img, stems, mean_lab, hists, grid_w, tile_px,
         small = img.resize((grid_w * block, grid_h * block), Image.LANCZOS)
         pool_h = hists[list(idx_pool)]
         # Banded like appearance mode: bound the float32 Lab working set.
-        band_rows = max(1, int(24e6 / (grid_w * block * block * 3 * 4)))
+        band_rows = max(1, int(12e6 / (grid_w * block * block * 3 * 4)))
         tile_hists = np.empty((n_tiles, 64), dtype=np.float32)
         for r0 in range(0, grid_h, band_rows):
             r1 = min(grid_h, r0 + band_rows)
@@ -392,8 +391,13 @@ def build_mosaic(img, stems, mean_lab, hists, grid_w, tile_px,
         q = lab.reshape(-1, 3)
         pool_lab = mean_lab[list(idx_pool)]
         if exact:
-            tree = cKDTree(pool_lab)
-            _, pick = tree.query(q, workers=-1)
+            e2 = (pool_lab ** 2).sum(axis=1)
+            pick = np.empty(n_tiles, dtype=np.int64)
+            for lo in range(0, n_tiles, 1024):
+                t = q[lo:lo + 1024]
+                D = ((t ** 2).sum(axis=1, keepdims=True) + e2[None, :]
+                     - 2.0 * (t @ pool_lab.T))
+                pick[lo:lo + t.shape[0]] = np.argmin(D, axis=1)
         else:
             e2 = (pool_lab ** 2).sum(axis=1)
 
@@ -493,7 +497,7 @@ def main():
 
     # Cap the output canvas so it fits in small-host memory (a full-size RGB
     # frame is 3 bytes/px; the free host kills the process over 512MB).
-    MAX_OUT_PIXELS = 48_000_000
+    MAX_OUT_PIXELS = 36_000_000
     grid_h_est = max(1, round(img.height / img.width * grid_w))
     out_px = grid_w * tile_px * grid_h_est * tile_px
     if out_px > MAX_OUT_PIXELS:
@@ -528,6 +532,7 @@ def main():
                 img, stems, mean_lab, hists, grid_w, tile_px,
                 mode=mode.replace("mean color", "mean"), emoji_indices=sel, thumbs=thumbs,
                 color_boost=boost, variety=variety, repel=repel, seed=int(seed))
+        gc.collect()
         last = {"signature": signature, "mosaic": mosaic, "matched": matched,
                 "gw": gw, "gh": gh, "elapsed": time.perf_counter() - t0}
         st.session_state.last_render = last
