@@ -16,6 +16,7 @@ Run:  streamlit run app.py
 
 import io
 import os
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -443,12 +444,37 @@ def main():
         return
 
     img = load_uploaded(uploaded.getvalue())
-    with st.spinner("Building mosaic..."):
-        thumbs = load_thumbs(tuple(stems))
-        mosaic, matched, (gw, gh) = build_mosaic(
-            img, stems, mean_lab, hists, grid_w, tile_px,
-            mode=mode.replace("mean color", "mean"), emoji_indices=sel, thumbs=thumbs,
-            color_boost=boost, variety=variety, repel=repel, seed=int(seed))
+
+    # Everything that affects the output, in one signature, so we can tell
+    # when the mosaic on screen no longer matches the current controls.
+    signature = (uploaded.name, uploaded.size, grid_w, tile_px, tuple(sel),
+                 boost, mode, variety, repel, int(seed))
+    last = st.session_state.get("last_render")
+
+    render = st.button("🖼️ Render mosaic", type="primary",
+                       help="Rebuild the mosaic with the current settings.")
+    if last is None:
+        render = True  # first visit: render once automatically
+
+    if render:
+        t0 = time.perf_counter()
+        with st.spinner("Rendering mosaic... (large grids can take a few seconds)"):
+            thumbs = load_thumbs(tuple(stems))
+            mosaic, matched, (gw, gh) = build_mosaic(
+                img, stems, mean_lab, hists, grid_w, tile_px,
+                mode=mode.replace("mean color", "mean"), emoji_indices=sel, thumbs=thumbs,
+                color_boost=boost, variety=variety, repel=repel, seed=int(seed))
+        last = {"signature": signature, "mosaic": mosaic, "matched": matched,
+                "gw": gw, "gh": gh, "elapsed": time.perf_counter() - t0}
+        st.session_state.last_render = last
+
+    if last["signature"] != signature:
+        st.warning("Settings changed - the mosaic below is from the previous settings. "
+                   "Press **Render mosaic** to update it.")
+    else:
+        st.caption(f"✅ Up to date - rendered in {last['elapsed']:.1f}s.")
+
+    mosaic, matched, gw, gh = last["mosaic"], last["matched"], last["gw"], last["gh"]
 
     c1, c2 = st.columns(2)
     c1.image(img, caption=f"Original ({img.width}×{img.height})", use_container_width=True)
