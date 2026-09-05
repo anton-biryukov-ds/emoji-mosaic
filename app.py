@@ -497,7 +497,7 @@ def main():
 
     # Cap the output canvas so it fits in small-host memory (a full-size RGB
     # frame is 3 bytes/px; the free host kills the process over 512MB).
-    MAX_OUT_PIXELS = 36_000_000
+    MAX_OUT_PIXELS = 24_000_000
     grid_h_est = max(1, round(img.height / img.width * grid_w))
     out_px = grid_w * tile_px * grid_h_est * tile_px
     if out_px > MAX_OUT_PIXELS:
@@ -532,9 +532,17 @@ def main():
                 img, stems, mean_lab, hists, grid_w, tile_px,
                 mode=mode.replace("mean color", "mean"), emoji_indices=sel, thumbs=thumbs,
                 color_boost=boost, variety=variety, repel=repel, seed=int(seed))
+        # Hold PNG bytes in session state (~15MB) rather than the raw PIL
+        # frame (3 bytes/px) - the difference decides OOM on a 512MB host.
+        out_w, out_h = mosaic.size
+        buf = io.BytesIO()
+        mosaic.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+        del mosaic, buf
         gc.collect()
-        last = {"signature": signature, "mosaic": mosaic, "matched": matched,
-                "gw": gw, "gh": gh, "elapsed": time.perf_counter() - t0}
+        last = {"signature": signature, "png": png_bytes, "matched": matched,
+                "gw": gw, "gh": gh, "out_w": out_w, "out_h": out_h,
+                "elapsed": time.perf_counter() - t0}
         st.session_state.last_render = last
 
     if last["signature"] != signature:
@@ -543,20 +551,19 @@ def main():
     else:
         st.caption(f"✅ Up to date - rendered in {last['elapsed']:.1f}s.")
 
-    mosaic, matched, gw, gh = last["mosaic"], last["matched"], last["gw"], last["gh"]
+    matched, gw, gh = last["matched"], last["gw"], last["gh"]
+    out_w, out_h = last["out_w"], last["out_h"]
 
     c1, c2 = st.columns(2)
     c1.image(img, caption=f"Original ({img.width}×{img.height})", width="stretch")
-    c2.image(mosaic, caption=f"Mosaic ({gw}×{gh} tiles, {mosaic.width}×{mosaic.height}px)",
+    c2.image(last["png"], caption=f"Mosaic ({gw}×{gh} tiles, {out_w}×{out_h}px)",
              width="stretch")
 
     used = sorted(set(matched))
     with st.expander(f"{len(used)} distinct emoji used"):
         st.write(" ".join(chars[stems.index(s)] for s in used))
 
-    buf = io.BytesIO()
-    mosaic.save(buf, format="PNG")
-    st.download_button("⬇️ Download PNG", buf.getvalue(),
+    st.download_button("⬇️ Download PNG", last["png"],
                        file_name="emoji_mosaic.png", mime="image/png")
 
 
