@@ -14,7 +14,9 @@ lose ties to fresher ones. Both are seeded for reproducibility.
 Run:  streamlit run app.py
 """
 
+import gc
 import io
+import math
 import os
 import time
 import urllib.request
@@ -290,40 +292,82 @@ def build_mosaic(img, stems, mean_lab, hists, grid_w, tile_px,
         thumb = int(round(thumbs.shape[1] / 3))  # thumb*thumb
         thumb = int(thumb ** 0.5)
         small = img.resize((grid_w * thumb, grid_h * thumb), Image.LANCZOS)
-        lab = rgb_to_lab(np.asarray(small).astype(np.float32) / 255.0)
-        lab[..., 1:] *= color_boost
-        tiles = lab.reshape(grid_h, thumb, grid_w, thumb, 3).transpose(0, 2, 1, 3, 4)
-        tiles = tiles.reshape(n_tiles, -1)
         pool = thumbs[list(idx_pool)]
         e2 = (pool ** 2).sum(axis=1)
+        tile_vec = thumb * thumb * 3
+        # Process the resized image in bands of tile rows so the float32 Lab
+        # working set stays bounded (~24MB per band; band + its Lab conversion
+        # + the tile-vector copy coexist transiently) on small hosts.
+        band_rows = max(1, int(24e6 / (grid_w * tile_vec * 4)))
+        pick = np.empty(n_tiles, dtype=np.int64)
+        top_idx_all, top_dist_all = [], []
+        for r0 in range(0, grid_h, band_rows):
+            r1 = min(grid_h, r0 + band_rows)
+            band = np.asarray(small.crop((0, r0 * thumb,
+                                          grid_w * thumb, r1 * thumb))
+                              ).astype(np.float32) / 255.0
+            lab = rgb_to_lab(band)
+            lab[..., 1:] *= color_boost
+            del band
+            n_band = (r1 - r0) * grid_w
+            tiles = lab.reshape(r1 - r0, thumb, grid_w, thumb, 3)
+            tiles = tiles.transpose(0, 2, 1, 3, 4).reshape(n_band, -1)
+            del lab
 
-        def chunks():
-            for lo in range(0, n_tiles, 512):
-                t = tiles[lo:lo + 512]
-                yield (t ** 2).sum(axis=1, keepdims=True) + e2[None, :] - 2.0 * (t @ pool.T)
+            def chunks():
+                for lo in range(0, n_band, 512):
+                    t = tiles[lo:lo + 512]
+                    yield ((t ** 2).sum(axis=1, keepdims=True) + e2[None, :]
+                           - 2.0 * (t @ pool.T))
 
-        if exact:
-            pick = np.empty(n_tiles, dtype=np.int64)
-            for lo, Dc in zip(range(0, n_tiles, 512), chunks()):
-                pick[lo:lo + 512] = np.argmin(Dc, axis=1)
-        else:
-            top_idx, top_dist = topk_candidates(chunks(), k)
+            if exact:
+                for lo, Dc in zip(range(0, n_band, 512), chunks()):
+                    pick[r0 * grid_w + lo:
+                         r0 * grid_w + lo + Dc.shape[0]] = np.argmin(Dc, axis=1)
+            else:
+                ti, td = topk_candidates(chunks(), k)
+                top_idx_all.append(ti)
+                top_dist_all.append(td)
+            del tiles
+        del small
+        gc.collect()
+        if not exact:
+            top_idx = np.concatenate(top_idx_all)
+            top_dist = np.concatenate(top_dist_all)
             pick = sample_matches(top_idx, top_dist, n_pool, variety, repel, seed)
         matched = [stems[idx_pool[p]] for p in pick]
     elif mode == "histogram":
         block = 8  # sub-samples per tile axis for the tile histogram
         small = img.resize((grid_w * block, grid_h * block), Image.LANCZOS)
-        lab = rgb_to_lab(np.asarray(small).astype(np.float32) / 255.0)
-        lab[..., 1:] *= color_boost
-        edges = [np.linspace(0, 100, 5), np.linspace(-128, 128, 5), np.linspace(-128, 128, 5)]
-        # per-tile histograms from the blocked image
-        tiles = lab.reshape(grid_h, block, grid_w, block, 3).transpose(0, 2, 1, 3, 4)
-        tile_hists = np.empty((n_tiles, 64), dtype=np.float32)
-        for t in range(n_tiles):
-            hh, _ = np.histogramdd(tiles[t // grid_w, t % grid_w].reshape(-1, 3), bins=edges)
-            v = hh.ravel()
-            tile_hists[t] = v / max(v.sum(), 1e-9)
         pool_h = hists[list(idx_pool)]
+        # Banded like appearance mode: bound the float32 Lab working set.
+        band_rows = max(1, int(24e6 / (grid_w * block * block * 3 * 4)))
+        tile_hists = np.empty((n_tiles, 64), dtype=np.float32)
+        for r0 in range(0, grid_h, band_rows):
+            r1 = min(grid_h, r0 + band_rows)
+            band = np.asarray(small.crop((0, r0 * block,
+                                          grid_w * block, r1 * block))
+                              ).astype(np.float32) / 255.0
+            lab = rgb_to_lab(band)
+            lab[..., 1:] *= color_boost
+            del band
+            # Quantize to the 4x4x4 Lab bins, then count per tile vectorized
+            # (one bincount-style pass instead of a per-tile histogramdd).
+            lb = np.clip((lab[..., 0] / 25).astype(np.int64), 0, 3)
+            ab = np.clip(((lab[..., 1] + 128) / 64).astype(np.int64), 0, 3)
+            bb = np.clip(((lab[..., 2] + 128) / 64).astype(np.int64), 0, 3)
+            del lab
+            binned = (lb * 16 + ab * 4 + bb).reshape(-1, block * block)
+            del lb, ab, bb
+            n_band = binned.shape[0]
+            counts = np.zeros((n_band, 64), dtype=np.float32)
+            np.add.at(counts, (np.arange(n_band)[:, None], binned), 1.0)
+            del binned
+            counts /= np.maximum(counts.sum(axis=1, keepdims=True), 1e-9)
+            tile_hists[r0 * grid_w:r1 * grid_w] = counts
+            del counts
+        del small
+        gc.collect()
 
         # chi-square distance, chunked over tiles to bound memory
         def chunks():
@@ -363,7 +407,9 @@ def build_mosaic(img, stems, mean_lab, hists, grid_w, tile_px,
             pick = sample_matches(top_idx, top_dist, n_pool, variety, repel, seed)
         matched = [stems[idx_pool[p]] for p in pick]
 
-    out = Image.new("RGBA", (grid_w * tile_px, grid_h * tile_px), (255, 255, 255, 255))
+    # RGB canvas directly: an RGBA canvas plus .convert("RGB") would hold two
+    # full-size frames at once (OOM guard for small hosts).
+    out = Image.new("RGB", (grid_w * tile_px, grid_h * tile_px), (255, 255, 255))
     cache = {}
     for t, stem in enumerate(matched):
         gy, gx = divmod(t, grid_w)
@@ -373,7 +419,7 @@ def build_mosaic(img, stems, mean_lab, hists, grid_w, tile_px,
             glyph = glyph.resize((tile_px, tile_px), Image.LANCZOS)
             cache[stem] = glyph
         out.paste(glyph, (gx * tile_px, gy * tile_px), glyph)
-    return out.convert("RGB"), matched, (grid_w, grid_h)
+    return out, matched, (grid_w, grid_h)
 
 
 def load_uploaded(file_bytes):
@@ -396,7 +442,7 @@ def main():
     st.caption("Turn any image into a mosaic of color-matched emoji (Twemoji glyphs, Lab-space nearest neighbor).")
 
     have = [f for f in os.listdir(EMOJI_DIR)] if os.path.isdir(EMOJI_DIR) else []
-    if len(have) < 3000:
+    if len(have) < 2500:
         st.info("First run: downloading the Twemoji emoji set (~3,800 small PNGs, one minute once).")
         bar = st.progress(0.0)
         ensure_assets(progress=bar)
@@ -445,6 +491,19 @@ def main():
 
     img = load_uploaded(uploaded.getvalue())
 
+    # Cap the output canvas so it fits in small-host memory (a full-size RGB
+    # frame is 3 bytes/px; the free host kills the process over 512MB).
+    MAX_OUT_PIXELS = 48_000_000
+    grid_h_est = max(1, round(img.height / img.width * grid_w))
+    out_px = grid_w * tile_px * grid_h_est * tile_px
+    if out_px > MAX_OUT_PIXELS:
+        orig_mp = out_px / 1e6
+        tile_px = max(8, int(tile_px * math.sqrt(MAX_OUT_PIXELS / out_px)))
+        st.warning(f"Output would be {orig_mp:.0f}MP at the chosen tile size - "
+                   f"capped tile size to {tile_px}px (~{MAX_OUT_PIXELS / 1e6:.0f}MP) "
+                   f"to stay within host memory. "
+                   f"Run locally for the full-resolution render.")
+
     # Everything that affects the output, in one signature, so we can tell
     # when the mosaic on screen no longer matches the current controls.
     signature = (uploaded.name, uploaded.size, grid_w, tile_px, tuple(sel),
@@ -457,6 +516,11 @@ def main():
         render = True  # first visit: render once automatically
 
     if render:
+        # Free the previous mosaic before building the new one so both
+        # full-size frames are never held at once.
+        st.session_state.pop("last_render", None)
+        last = None
+        gc.collect()
         t0 = time.perf_counter()
         with st.spinner("Rendering mosaic... (large grids can take a few seconds)"):
             thumbs = load_thumbs(tuple(stems))
@@ -477,9 +541,9 @@ def main():
     mosaic, matched, gw, gh = last["mosaic"], last["matched"], last["gw"], last["gh"]
 
     c1, c2 = st.columns(2)
-    c1.image(img, caption=f"Original ({img.width}×{img.height})", use_container_width=True)
+    c1.image(img, caption=f"Original ({img.width}×{img.height})", width="stretch")
     c2.image(mosaic, caption=f"Mosaic ({gw}×{gh} tiles, {mosaic.width}×{mosaic.height}px)",
-             use_container_width=True)
+             width="stretch")
 
     used = sorted(set(matched))
     with st.expander(f"{len(used)} distinct emoji used"):
